@@ -1,194 +1,151 @@
 <?php
-// index.php — API sortir cepat untuk Railway
+// ==== CORS agar bisa dipanggil langsung dari web ====
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Methods: POST, OPTIONS');
+header('Access-Control-Allow-Headers: Content-Type, X-Requested-With');
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(204); exit; }
 
-header("Access-Control-Allow-Origin: *");
-header("Content-Type: application/json; charset=utf-8");
+header('Content-Type: application/json; charset=UTF-8');
 
-if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-  http_response_code(200);
-  echo json_encode([
-    "ok" => true,
-    "message" => "Kirim POST JSON: {\"ids\":[\"12345\",\"ABCDE\", ...]}",
-    "example" => "/",
-  ]);
-  exit;
-}
+// ==== Input ====
+$in  = json_decode(file_get_contents('php://input'), true) ?: [];
+$ids = isset($in['ids']) && is_array($in['ids']) ? $in['ids'] : [];
+$ids = array_values(array_filter(array_map(fn($v)=>trim((string)$v), $ids), fn($v)=>$v!==''));
+if (!$ids) { http_response_code(400); echo json_encode(["aman"=>[],"banned"=>[]]); exit; }
 
-$input = json_decode(file_get_contents('php://input'), true);
-$ids = isset($input['ids']) && is_array($input['ids']) ? $input['ids'] : [];
-
-$ids = array_values(array_filter(array_map(function($v){
-  $v = trim((string)$v);
-  // biarkan alnum saja; kalau kamu butuh format lain, tinggal ubah regex ini
-  return $v !== '' ? $v : null;
-}, $ids)));
-
-if (!$ids) {
-  http_response_code(400);
-  echo json_encode(["error" => "Input tidak valid. Kirim {\"ids\":[...]}"]);
-  exit;
-}
-
-// ———————————————————————————————
-// Konfigurasi target endpoint & header (meniru curl kamu)
-$TARGET_URL = "https://i.mnigx5.com/web/infullRequest.do";
-$COMMON_HEADERS = [
-  "Content-Type: application/x-www-form-urlencoded; charset=UTF-8",
-  "X-Requested-With: XMLHttpRequest",
-  "Origin: https://i.mnigx5.com",
-  "Referer: https://i.mnigx5.com",
-  // beberapa user-agent populer, diacak untuk kurangi blokir heuristik
-];
-$UAS = [
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-  "Mozilla/5.0 (Linux; Android 12; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Mobile Safari/537.36",
+// ==== Target endpoints ====
+$ENDPOINTS = [
+  ["https://i.mnigx5.com/web/infullRequest.do","https://i.mnigx5.com"],
+  ["https://i.xnzeq.com/infull/infullRequest.do","https://i.xnzeq.com"], // fallback
 ];
 
-// ———————————————————————————————
-// Helper klasifikasi hasil
-function klasifikasi($rawJson) {
-  $data = json_decode($rawJson, true);
-  $code = $data['code'] ?? null;
-  $msg  = $data['message'] ?? '';
+// ==== Tuning anti-spam ====
+// Proses SEKUENSIAL dalam 1 koneksi (keep-alive).
+// Tidak ada delay global. Jeda mikro (120–250ms) HANYA saat 1025 (rate limit).
+define('JITTER_MIN_MS', 120);
+define('JITTER_MAX_MS', 250);
 
-  // Aturan dari kamu:
-  // - "Item yang dibeli tidak ada atau telah dihapus." => AMAN
-  // - "Sistem sedang dalam maintenance." => BANNED
-  // Tambahan kode yang biasa muncul:
-  // - 1025 / 201 sering dianggap AMAN
-  // - 1135 / 1125 sering dianggap BANNED
-  $m = mb_strtolower($msg);
-
-  if (strpos($m, "item yang dibeli tidak ada atau telah dihapus") !== false) {
-    return ["status" => "AMAN", "code" => $code, "message" => $msg];
-  }
-  if (strpos($m, "sistem sedang dalam maintenance") !== false) {
-    return ["status" => "BANNED", "code" => $code, "message" => $msg];
-  }
-
-  if (in_array($code, ["1025","201"], true)) {
-    return ["status" => "AMAN", "code" => $code, "message" => $msg];
-  }
-  if (in_array($code, ["1135","1125"], true)) {
-    return ["status" => "BANNED", "code" => $code, "message" => $msg];
-  }
-
-  return ["status" => "UNKNOWN", "code" => $code, "message" => $msg];
+// ==== Header mirip curl Android ====
+function baseHeaders($origin){
+  return [
+    "Content-Type: application/x-www-form-urlencoded; charset=UTF-8",
+    "X-Requested-With: XMLHttpRequest",
+    "Origin: $origin",
+    "Referer: $origin",
+    "User-Agent: Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Mobile Safari/537.36",
+    "Accept: application/json,text/plain,*/*",
+    "Connection: keep-alive",
+  ];
 }
 
-// ———————————————————————————————
-// curl_multi paralel biar cepat
-$mh = curl_multi_init();
-$chs = [];
-$results = [];
+// ==== Parser & mapping ====
+function parse_code_msg(string $resp): array {
+  $j = json_decode($resp, true);
+  if (is_array($j)) {
+    $code = isset($j['code']) ? (string)$j['code'] : null;
+    $msg  = isset($j['message']) ? (string)$j['message'] : null;
+    if ($code !== null || $msg !== null) return [$code,$msg];
+  }
+  $plain = trim(strip_tags($resp));
+  if (preg_match('/^\s*(\d{3,4})(?:\s*[#:\-]\s*|\s+)?(.*)$/su', $plain, $m)) {
+    $code = $m[1]; $msg = trim($m[2] ?? '');
+    return [$code, $msg !== '' ? $msg : null];
+  }
+  if (preg_match('/"message"\s*:\s*"(?P<m>.*?)"/isu', $resp, $mm)) {
+    return [null, html_entity_decode($mm['m'], ENT_QUOTES|ENT_HTML5, 'UTF-8')];
+  }
+  return [null,null];
+}
+function norm(?string $s): string {
+  if(!$s) return '';
+  $s = html_entity_decode($s, ENT_QUOTES|ENT_HTML5, 'UTF-8');
+  $s = preg_replace('/\s+/u',' ', $s);
+  return mb_strtolower(trim($s), 'UTF-8');
+}
+function decide($code,$msg): string {
+  $c = (string)($code ?? '');
+  $m = norm($msg ?? '');
+  // by code
+  if ($c === '1135' || $c === '1125') return 'BANNED';
+  if ($c === '1025' || $c === '201')  return 'AMAN';
+  if ($c === '0035')                  return 'SKIP';
+  // by message
+  if (strpos($m,'maintenance') !== false) return 'BANNED';
+  if (strpos($m,'item yang dibeli tidak ada atau telah dihapus') !== false) return 'AMAN';
+  if (strpos($m,'kesalahan id pengguna') !== false) return 'AMAN';
+  if (strpos($m,'terlalu sering') !== false) return 'AMAN';
+  return 'SKIP';
+}
 
-// Batasi paralel biar stabil di Railway (mis. 20). Ubah kalau perlu.
-$MAX_CONCURRENCY = 20;
-$queue = $ids;
-$active = 0;
-
-// fungsi untuk menyiapkan 1 handle
-$spawn = function($id) use ($TARGET_URL, $COMMON_HEADERS, $UAS) {
-  $ch = curl_init();
-  $ua = $UAS[array_rand($UAS)];
+// ==== Helper bikin handle cURL (reuse / keep-alive) ====
+function new_handle(string $url, string $origin) {
+  $ch = curl_init($url);
   curl_setopt_array($ch, [
-    CURLOPT_URL            => $TARGET_URL,
-    CURLOPT_POST           => true,
-    CURLOPT_POSTFIELDS     => http_build_query([
-      "userId"     => $id,
-      "infullType" => "domino",
-      "version"    => "1.0",
-    ]),
-    CURLOPT_HTTPHEADER     => array_merge($COMMON_HEADERS, ["User-Agent: $ua"]),
     CURLOPT_RETURNTRANSFER => true,
-    CURLOPT_HEADER         => false,
-    CURLOPT_TIMEOUT        => 12,       // jangan terlalu besar
+    CURLOPT_POST           => true,
+    CURLOPT_HTTPHEADER     => baseHeaders($origin),
+    CURLOPT_ENCODING       => "", // gzip/deflate/br
+    CURLOPT_HTTP_VERSION   => CURL_HTTP_VERSION_1_1,
     CURLOPT_CONNECTTIMEOUT => 6,
-    CURLOPT_SSL_VERIFYPEER => true,
-    CURLOPT_SSL_VERIFYHOST => 2,
+    CURLOPT_TIMEOUT        => 15,
+    CURLOPT_FOLLOWLOCATION => true,
+    CURLOPT_MAXREDIRS      => 2,
+    CURLOPT_IPRESOLVE      => CURL_IPRESOLVE_V4,
+    CURLOPT_FORBID_REUSE   => false,
+    CURLOPT_FRESH_CONNECT  => false,
   ]);
-  // simpan id ke handle untuk mapping
-  curl_setopt($ch, CURLOPT_PRIVATE, $id);
   return $ch;
-};
-
-// isi slot awal
-while ($active < $MAX_CONCURRENCY && !empty($queue)) {
-  $id = array_shift($queue);
-  $ch = $spawn($id);
-  $chs[(int)$ch] = $ch;
-  curl_multi_add_handle($mh, $ch);
-  $active++;
 }
 
-// loop event
-do {
-  // jalankan
-  $status = curl_multi_exec($mh, $running);
-  if ($status > CURLM_OK) break;
+// ==== Siapkan 2 handle: utama & fallback ====
+[$url1,$origin1] = $ENDPOINTS[0];
+[$url2,$origin2] = $ENDPOINTS[1];
+$h1 = new_handle($url1, $origin1);
+$h2 = new_handle($url2, $origin2);
 
-  // ambil yang selesai
-  while ($info = curl_multi_info_read($mh)) {
-    /** @var resource $done */
-    $done = $info['handle'];
-    $id = curl_getinfo($done, CURLINFO_PRIVATE);
-    $http = curl_getinfo($done, CURLINFO_HTTP_CODE);
-    $body = curl_multi_getcontent($done);
-    $err  = curl_error($done);
+// ==== Proses semua ID, sekuensial, jitter mikro hanya saat 1025 ====
+$aman = []; $banned = [];
 
-    if ($err) {
-      $results[] = ["id"=>$id, "http"=>$http, "error"=>$err, "raw"=>$body];
-    } else {
-      $results[] = ["id"=>$id, "http"=>$http, "error"=>null, "raw"=>$body];
-    }
+foreach ($ids as $id) {
+  $payload = http_build_query([
+    "userId"     => $id,
+    "infullType" => "domino",
+    "version"    => "1.0"
+  ]);
 
-    curl_multi_remove_handle($mh, $done);
-    curl_close($done);
-    unset($chs[(int)$done]);
-    $active--;
+  // try endpoint utama
+  curl_setopt($h1, CURLOPT_POSTFIELDS, $payload);
+  $raw  = curl_exec($h1);
+  $http = curl_getinfo($h1, CURLINFO_RESPONSE_CODE) ?: 0;
 
-    // isi slot lagi dari antrean
-    if (!empty($queue)) {
-      $nextId = array_shift($queue);
-      $ch = $spawn($nextId);
-      $chs[(int)$ch] = $ch;
-      curl_multi_add_handle($mh, $ch);
-      $active++;
+  $code = null; $msg = null;
+  if ($http === 200 && is_string($raw) && $raw !== '') {
+    [$code,$msg] = parse_code_msg($raw);
+  }
+
+  // rate-limit → coba sekali ke endpoint fallback + jitter mikro
+  if ((string)$code === '1025') {
+    $delay = random_int(JITTER_MIN_MS, JITTER_MAX_MS) * 1000; // us
+    usleep($delay); // hanya saat 1025; tidak ada delay lain
+    curl_setopt($h2, CURLOPT_POSTFIELDS, $payload);
+    $raw2  = curl_exec($h2);
+    $http2 = curl_getinfo($h2, CURLINFO_RESPONSE_CODE) ?: 0;
+    if ($http2 === 200 && is_string($raw2) && $raw2 !== '') {
+      [$code,$msg] = parse_code_msg($raw2);
     }
   }
 
-  // tunggu event IO sebentar biar CPU nggak 100%
-  if ($running) curl_multi_select($mh, 0.5);
-
-} while ($running || !empty($queue));
-
-curl_multi_close($mh);
-
-// ———————————————————————————————
-// susun hasil akhir
-$aman = [];
-$banned = [];
-$lainnya = [];
-
-foreach ($results as $r) {
-  if ($r['error']) {
-    $lainnya[] = ["id"=>$r['id'], "status"=>"ERROR", "note"=>$r['error']];
-    continue;
-  }
-  $k = klasifikasi($r['raw']);
-  if ($k['status'] === "AMAN") {
-    $aman[] = $r['id'];
-  } elseif ($k['status'] === "BANNED") {
-    $banned[] = $r['id'];
-  } else {
-    $lainnya[] = ["id"=>$r['id'], "status"=>"UNKNOWN", "code"=>$k['code'] ?? null, "note"=>$k['message'] ?? null];
-  }
+  $st = decide($code,$msg);
+  if ($st === 'AMAN')       $aman[]   = $id;
+  elseif ($st === 'BANNED') $banned[] = $id;
+  // SKIP diabaikan agar output tetap {aman:[], banned:[]}
 }
 
+curl_close($h1);
+curl_close($h2);
+
+// ==== Output ====
 echo json_encode([
-  "aman"    => array_values($aman),
-  "banned"  => array_values($banned),
-  "lainnya" => $lainnya,
+  "aman"   => array_values(array_unique($aman)),
+  "banned" => array_values(array_unique($banned))
 ], JSON_UNESCAPED_UNICODE);
